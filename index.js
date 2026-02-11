@@ -1,3 +1,7 @@
+console.log("==== ENV VALIDATION ====");
+console.log("OPENAI_API_KEY exists:", !!process.env.OPENAI_API_KEY);
+console.log("OPENAI_MODEL:", process.env.OPENAI_MODEL);
+console.log("========================");
 const express = require("express");
 const bodyParser = require("body-parser");
 const twilio = require("twilio");
