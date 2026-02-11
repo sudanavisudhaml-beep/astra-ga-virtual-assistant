@@ -3,6 +3,8 @@ const bodyParser = require("body-parser");
 const twilio = require("twilio");
 
 const app = express();
+console.log("ENV CHECK - OPENAI_API_KEY exists:", !!process.env.OPENAI_API_KEY);
+console.log("ENV CHECK - OPENAI_MODEL:", process.env.OPENAI_MODEL || "(not set)");
 app.use(bodyParser.urlencoded({ extended: false }));
 
 /**
