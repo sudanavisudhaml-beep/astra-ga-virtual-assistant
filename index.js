@@ -2,13 +2,16 @@ console.log("==== ENV VALIDATION ====");
 console.log("OPENAI_API_KEY exists:", !!process.env.OPENAI_API_KEY);
 console.log("OPENAI_MODEL:", process.env.OPENAI_MODEL);
 console.log("========================");
+
 const express = require("express");
 const bodyParser = require("body-parser");
 const twilio = require("twilio");
 
+// Node 18+ biasanya sudah ada fetch global.
+// Kalau suatu saat error "fetch is not defined", aktifkan ini:
+// const fetch = (...args) => import("node-fetch").then(({default: fetch}) => fetch(...args));
+
 const app = express();
-console.log("ENV CHECK - OPENAI_API_KEY exists:", !!process.env.OPENAI_API_KEY);
-console.log("ENV CHECK - OPENAI_MODEL:", process.env.OPENAI_MODEL || "(not set)");
 app.use(bodyParser.urlencoded({ extended: false }));
 
 /**
@@ -17,14 +20,16 @@ app.use(bodyParser.urlencoded({ extended: false }));
  * =========================
  */
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // bisa kamu ganti di Railway Variables
-const GPT_TIMEOUT_MS = parseInt(process.env.GPT_TIMEOUT_MS || "8000", 10);
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const GPT_TIMEOUT_MS = parseInt(process.env.GPT_TIMEOUT_MS || "15000", 10); // naikin biar gak gampang timeout
+
+console.log("ENV CHECK - OPENAI_API_KEY exists:", !!OPENAI_API_KEY);
+console.log("ENV CHECK - OPENAI_MODEL:", OPENAI_MODEL);
 
 /**
  * =========================
  * In-memory stores (demo)
  * =========================
- * NOTE: Ini hanya sementara. Nanti tiket bisa kita simpan ke DB/Sheet/Jira.
  */
 const sessions = new Map();
 const tickets = new Map();
@@ -123,10 +128,6 @@ function descPrompt() {
   return `Jelaskan keluhannya singkat ya.\n(atau 0 untuk Menu)`;
 }
 
-function mediaPrompt() {
-  return `Jika ada foto/video kirim sekarang.\nJika tidak ada balas: SKIP`;
-}
-
 /**
  * =========================
  * SOP
@@ -211,11 +212,10 @@ function resetSession(userId) {
 
 /**
  * =========================
- * GPT Helpers (with timeout)
+ * GPT Helpers (with timeout + DEBUG)
  * =========================
  */
 function sanitizeUserText(text) {
-  // basic trim + max length
   const t = (text || "").trim();
   if (t.length > 1500) return t.slice(0, 1500) + "…";
   return t;
@@ -223,6 +223,7 @@ function sanitizeUserText(text) {
 
 async function callGPT(messages) {
   if (!OPENAI_API_KEY) {
+    console.log("[OPENAI] SKIP: OPENAI_API_KEY missing");
     return { ok: false, text: "" };
   }
 
@@ -245,24 +246,36 @@ async function callGPT(messages) {
       }),
     });
 
-    const data = await resp.json().catch(() => ({}));
+    const rawText = await resp.text();
+    let data = {};
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      data = { _raw: rawText };
+    }
 
     if (!resp.ok) {
+      // IMPORTANT: jangan pernah log API key
+      console.log("[OPENAI] ERROR status:", resp.status);
+      console.log("[OPENAI] ERROR body:", (rawText || "").slice(0, 500));
       return { ok: false, text: "" };
     }
 
     const text = data?.choices?.[0]?.message?.content?.trim() || "";
+    if (!text) {
+      console.log("[OPENAI] OK but empty text");
+      return { ok: false, text: "" };
+    }
+
     return { ok: true, text };
   } catch (e) {
+    console.log("[OPENAI] EXCEPTION:", e?.name || "Error", e?.message || "");
     return { ok: false, text: "" };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-/**
- * GPT: SOP Q&A
- */
 async function gptAnswerSOP(question) {
   const q = sanitizeUserText(question);
 
@@ -271,10 +284,9 @@ async function gptAnswerSOP(question) {
       role: "system",
       content:
         "Kamu adalah Astra GA Virtual Assistant. Jawab ringkas, profesional, dan praktis. " +
-        "Jika pertanyaan butuh data spesifik kantor (jadwal aktual, nomor internal, SOP internal) yang tidak kamu miliki, " +
-        "jawab dengan template + langkah umum, lalu sarankan hubungi operator GA. " +
-        "Jangan minta/menyebut data sensitif (NIK, nomor HP pribadi, detail keamanan). " +
-        "Akhiri jawaban dengan satu pertanyaan klarifikasi jika perlu.",
+        "Jika butuh data spesifik kantor yang tidak kamu miliki, jawab dengan template + langkah umum, lalu sarankan hubungi operator GA. " +
+        "Jangan minta/menyebut data sensitif. " +
+        "Akhiri dengan 1 pertanyaan klarifikasi jika perlu.",
     },
     { role: "user", content: q },
   ];
@@ -283,10 +295,6 @@ async function gptAnswerSOP(question) {
   return out.ok ? out.text : "";
 }
 
-/**
- * GPT: Rapihkan komplain
- * Output format: JSON (title, cleaned_description, suggested_category, suggested_urgency)
- */
 async function gptTidyComplaint({ category, urgency, location, description }) {
   const desc = sanitizeUserText(description);
 
@@ -317,20 +325,14 @@ async function gptTidyComplaint({ category, urgency, location, description }) {
   if (!out.ok) return null;
 
   try {
-    // try parse json
-    const jsonText = out.text
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .trim();
+    const jsonText = out.text.replace(/```json/gi, "").replace(/```/g, "").trim();
     return JSON.parse(jsonText);
   } catch {
+    console.log("[OPENAI] JSON parse failed from model output");
     return null;
   }
 }
 
-/**
- * GPT: Fallback ketika input di luar menu
- */
 async function gptFallbackAnswer(userText) {
   const q = sanitizeUserText(userText);
 
@@ -339,16 +341,20 @@ async function gptFallbackAnswer(userText) {
       role: "system",
       content:
         "Kamu adalah Astra GA Virtual Assistant. User mengirim pesan yang tidak cocok dengan menu. " +
-        "Tugasmu: (1) jawab singkat jika bisa (umum), (2) arahkan user kembali ke menu dengan jelas. " +
-        "Jika itu komplain fasilitas, sarankan pilih 1 untuk buat ticket. " +
-        "Jika itu SOP, sarankan pilih 3. " +
-        "Jangan halu data internal yang tidak kamu tahu.",
+        "Tugasmu: (1) jawab singkat jika bisa, (2) arahkan user kembali ke menu. " +
+        "Jika komplain fasilitas, sarankan pilih 1. Jika SOP, sarankan pilih 3.",
     },
     { role: "user", content: q },
   ];
 
   const out = await callGPT(messages);
   return out.ok ? out.text : "";
+}
+
+function bodyToUrgencyText(u) {
+  if (u === "1") return "Darurat";
+  if (u === "2") return "Tinggi";
+  return "Normal";
 }
 
 /**
@@ -358,6 +364,20 @@ async function gptFallbackAnswer(userText) {
  */
 app.get("/", (req, res) => {
   res.status(200).send("Astra GA Virtual Assistant is running");
+});
+
+// Quick test from browser: /gpt-test
+app.get("/gpt-test", async (req, res) => {
+  const out = await callGPT([
+    { role: "system", content: "Jawab 1 kata saja: OK" },
+    { role: "user", content: "Tes" },
+  ]);
+  res.status(out.ok ? 200 : 500).json({
+    ok: out.ok,
+    model: OPENAI_MODEL,
+    keyExists: !!OPENAI_API_KEY,
+    sample: out.text || "",
+  });
 });
 
 app.post("/whatsapp", async (req, res) => {
@@ -371,11 +391,10 @@ app.post("/whatsapp", async (req, res) => {
   const session = getSession(from);
 
   /**
-   * =========================
    * Global Commands
-   * =========================
    */
   if (body === "99") {
+    // hidden reset
     resetSession(from);
     twiml.message("Session di-reset.\n\n" + menuText());
     return res.type("text/xml").send(twiml.toString());
@@ -394,9 +413,7 @@ app.post("/whatsapp", async (req, res) => {
   }
 
   /**
-   * =========================
    * MENU MODE
-   * =========================
    */
   if (session.mode === "MENU") {
     if (body === "1") {
@@ -428,49 +445,38 @@ app.post("/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // Fallback GPT (input di luar menu)
+    // Fallback GPT
     const fb = await gptFallbackAnswer(body);
-    if (fb) {
-      twiml.message(`${fb}\n\n—\n${menuText()}`);
-    } else {
-      twiml.message(menuText());
-    }
+    if (fb) twiml.message(`${fb}\n\n—\n${menuText()}`);
+    else twiml.message(menuText());
+
     return res.type("text/xml").send(twiml.toString());
   }
 
   /**
-   * =========================
-   * SOP MODE (GPT + template)
-   * =========================
+   * SOP MODE
    */
   if (session.mode === "SOP") {
-    // Jika pilih angka 1-5, kasih template singkat
     const templ = sopTemplateByChoice(body);
     if (templ) {
       twiml.message(`${templ}\n\nKetik 0 untuk Menu, atau tanya lanjut di sini.`);
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // Selain itu: dianggap pertanyaan bebas → GPT
     const ans = await gptAnswerSOP(body);
-    if (ans) {
-      twiml.message(`${ans}\n\nKetik 0 untuk Menu.`);
-    } else {
-      twiml.message("Maaf, sistem SOP sedang sibuk. Coba lagi atau ketik 0 untuk Menu.");
-    }
+    if (ans) twiml.message(`${ans}\n\nKetik 0 untuk Menu.`);
+    else twiml.message("Maaf, sistem SOP sedang sibuk. Coba lagi atau ketik 0 untuk Menu.");
+
     return res.type("text/xml").send(twiml.toString());
   }
 
   /**
-   * =========================
    * CHECK STATUS
-   * =========================
    */
   if (session.mode === "CHECK_STATUS") {
     const ticket = tickets.get(body.toUpperCase());
-    if (!ticket) {
-      twiml.message("Ticket tidak ditemukan.\n\nKetik 0 untuk Menu.");
-    } else {
+    if (!ticket) twiml.message("Ticket tidak ditemukan.\n\nKetik 0 untuk Menu.");
+    else {
       twiml.message(
         `Status ${ticket.id}: OPEN\nKategori: ${ticket.category}\nLokasi: ${ticket.location}\nJudul: ${ticket.title || "-"}`
       );
@@ -479,9 +485,7 @@ app.post("/whatsapp", async (req, res) => {
   }
 
   /**
-   * =========================
    * CATEGORY
-   * =========================
    */
   if (session.mode === "CATEGORY") {
     if (categoryMap[body]) {
@@ -495,9 +499,7 @@ app.post("/whatsapp", async (req, res) => {
   }
 
   /**
-   * =========================
    * LOCATION
-   * =========================
    */
   if (session.mode === "LOCATION") {
     session.ticketDraft.location = body;
@@ -507,13 +509,11 @@ app.post("/whatsapp", async (req, res) => {
   }
 
   /**
-   * =========================
    * URGENCY
-   * =========================
    */
   if (session.mode === "URGENCY") {
     if (["1", "2", "3"].includes(body)) {
-      session.ticketDraft.urgency = body; // 1/2/3
+      session.ticketDraft.urgency = body;
       session.mode = "DESC";
       twiml.message(descPrompt());
     } else {
@@ -523,17 +523,13 @@ app.post("/whatsapp", async (req, res) => {
   }
 
   /**
-   * =========================
-   * DESC (Auto rapihkan via GPT)
-   * =========================
+   * DESC (Auto tidy via GPT)
    */
   if (session.mode === "DESC") {
     session.ticketDraft.description_raw = body;
 
-    // map urgency user → text
     const urgencyText = bodyToUrgencyText(session.ticketDraft.urgency);
 
-    // Call GPT to tidy complaint (optional)
     const tidy = await gptTidyComplaint({
       category: session.ticketDraft.category || "Lainnya",
       urgency: urgencyText,
@@ -563,15 +559,14 @@ app.post("/whatsapp", async (req, res) => {
   }
 
   /**
-   * =========================
-   * MEDIA → Create Ticket
-   * =========================
+   * MEDIA -> Create Ticket
    */
   if (session.mode === "MEDIA") {
     if (numMedia > 0) {
       session.ticketDraft.media = "Media attached";
     }
 
+    // user can reply SKIP
     const id = makeTicketId();
 
     const ticket = {
@@ -611,20 +606,11 @@ app.post("/whatsapp", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // Default fallback
+  // default fallback
   twiml.message(menuText());
   return res.type("text/xml").send(twiml.toString());
 });
 
-/**
- * helpers
- */
-function bodyToUrgencyText(u) {
-  if (u === "1") return "Darurat";
-  if (u === "2") return "Tinggi";
-  return "Normal";
-}
-
 // Railway Port
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
